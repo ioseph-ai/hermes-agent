@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
-from hermes_cli.kanban_db_skills import _normalize_task_skills
+from hermes_cli.kanban_db_skills import _normalize_task_skills, validate_task_skills_for_assignee
 
 _log = logging.getLogger(__name__)
 
@@ -1199,6 +1199,9 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    # Profiles are islands: resolve against the ASSIGNEE's trees, never the creating
+    # session's, or the worker aborts at boot on every retry.
+    validate_task_skills_for_assignee(skills_list, assignee)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1435,7 +1438,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -1444,6 +1447,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # Reassignment moves the card to another profile's island: its skills must
+        # resolve THERE or the next dispatch boots without them.
+        if profile and row["skills"]:
+            validate_task_skills_for_assignee(json.loads(row["skills"]), profile)
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
